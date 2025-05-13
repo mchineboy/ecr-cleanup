@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"flag"
+	"os"
 	"testing"
 	"time"
 
@@ -17,6 +19,12 @@ type MockECRClient struct {
 	ListImagesOutput           *ecr.ListImagesOutput
 	DescribeImagesOutput       *ecr.DescribeImagesOutput
 	BatchDeleteImageOutput     *ecr.BatchDeleteImageOutput
+
+	// Errors to return (nil means no error)
+	DescribeRepositoriesError error
+	ListImagesError           error
+	DescribeImagesError       error
+	BatchDeleteImageError     error
 
 	// Track calls to methods
 	DescribeRepositoriesCalls int
@@ -39,6 +47,16 @@ func (m *MockECRClient) DescribeRepositories(ctx context.Context, params *ecr.De
 	m.DescribeRepositoriesCalls++
 	m.LastDescribeRepositoriesInput = params
 	
+	// Return error if set
+	if m.DescribeRepositoriesError != nil {
+		return nil, m.DescribeRepositoriesError
+	}
+	
+	// Handle nil output case as an error for tests
+	if m.DescribeRepositoriesOutput == nil {
+		return nil, &types.ServerException{Message: aws.String("Test server error")}
+	}
+	
 	// Special handling for pagination testing
 	if params.NextToken != nil && m.NextDescribeRepositoriesOutput != nil {
 		return m.NextDescribeRepositoriesOutput, nil
@@ -51,6 +69,12 @@ func (m *MockECRClient) DescribeRepositories(ctx context.Context, params *ecr.De
 func (m *MockECRClient) ListImages(ctx context.Context, params *ecr.ListImagesInput, optFns ...func(*ecr.Options)) (*ecr.ListImagesOutput, error) {
 	m.ListImagesCalls++
 	m.LastListImagesInput = params
+	
+	// Return error if set
+	if m.ListImagesError != nil {
+		return nil, m.ListImagesError
+	}
+	
 	return m.ListImagesOutput, nil
 }
 
@@ -58,6 +82,12 @@ func (m *MockECRClient) ListImages(ctx context.Context, params *ecr.ListImagesIn
 func (m *MockECRClient) DescribeImages(ctx context.Context, params *ecr.DescribeImagesInput, optFns ...func(*ecr.Options)) (*ecr.DescribeImagesOutput, error) {
 	m.DescribeImagesCalls++
 	m.LastDescribeImagesInput = params
+	
+	// Return error if set
+	if m.DescribeImagesError != nil {
+		return nil, m.DescribeImagesError
+	}
+	
 	return m.DescribeImagesOutput, nil
 }
 
@@ -65,6 +95,12 @@ func (m *MockECRClient) DescribeImages(ctx context.Context, params *ecr.Describe
 func (m *MockECRClient) BatchDeleteImage(ctx context.Context, params *ecr.BatchDeleteImageInput, optFns ...func(*ecr.Options)) (*ecr.BatchDeleteImageOutput, error) {
 	m.BatchDeleteImageCalls++
 	m.LastBatchDeleteImageInput = params
+	
+	// Return error if set
+	if m.BatchDeleteImageError != nil {
+		return nil, m.BatchDeleteImageError
+	}
+	
 	return m.BatchDeleteImageOutput, nil
 }
 
@@ -227,6 +263,9 @@ func TestGetImageDetails(t *testing.T) {
 			t.Errorf("Expected 0 calls to DescribeImages, got %d", mockClient.DescribeImagesCalls)
 		}
 	})
+	
+	// Note: We can't effectively test pagination with our mock structure
+	// Because we can't override the ListImages method in Go
 }
 
 // TestSelectImagesForDeletion tests the selectImagesForDeletion function
@@ -317,6 +356,48 @@ func TestSelectImagesForDeletion(t *testing.T) {
 			t.Fatalf("Expected 0 images to delete, got %d", len(toDelete))
 		}
 	})
+	
+	// Test with empty image list
+	t.Run("Empty image list", func(t *testing.T) {
+		config := Config{
+			Days: 10,
+		}
+		
+		toDelete := selectImagesForDeletion([]types.ImageDetail{}, config)
+		
+		if len(toDelete) != 0 {
+			t.Fatalf("Expected 0 images to delete from empty list, got %d", len(toDelete))
+		}
+	})
+	
+	// Test with nil ImagePushedAt
+	t.Run("Nil pushed time", func(t *testing.T) {
+		nilTimeImages := []types.ImageDetail{
+			{
+				ImageDigest: aws.String("sha256:nil"),
+				ImageTags: []string{"nil-time"},
+				// ImagePushedAt is nil
+			},
+			{
+				ImageDigest: aws.String("sha256:valid"),
+				ImageTags: []string{"valid-time"},
+				ImagePushedAt: aws.Time(now.AddDate(0, 0, -15)),
+			},
+		}
+		
+		config := Config{
+			Days: 10,
+		}
+		
+		toDelete := selectImagesForDeletion(nilTimeImages, config)
+		
+		if len(toDelete) != 1 {
+			t.Fatalf("Expected 1 image to delete (the one with valid time), got %d", len(toDelete))
+		}
+		if *toDelete[0].ImageDigest != "sha256:valid" {
+			t.Errorf("Expected to delete image with valid time, got %s", *toDelete[0].ImageDigest)
+		}
+	})
 }
 
 // TestSortImagesByPushedTime tests the sortImagesByPushedTime function
@@ -359,6 +440,41 @@ func TestSortImagesByPushedTime(t *testing.T) {
 	if *images[3].ImageDigest != "sha256:4" {
 		t.Errorf("Expected fourth image after sort to be sha256:4, got %s", *images[3].ImageDigest)
 	}
+	
+	// Test with nil ImagePushedAt values
+	t.Run("Sorting with nil times", func(t *testing.T) {
+		nilTimeImages := []types.ImageDetail{
+			{ // No pushed time
+				ImageDigest: aws.String("sha256:nil1"),
+			},
+			{ // Valid time
+				ImageDigest: aws.String("sha256:valid"),
+				ImagePushedAt: aws.Time(now.AddDate(0, 0, -5)),
+			},
+			{ // Another nil time
+				ImageDigest: aws.String("sha256:nil2"),
+			},
+		}
+		
+		// Sort the images
+		sortImagesByPushedTime(nilTimeImages)
+		
+		// Check the order - valid time should be first, nil times at the end
+		if *nilTimeImages[0].ImageDigest != "sha256:valid" {
+			t.Errorf("Expected first image after sort to be sha256:valid, got %s", *nilTimeImages[0].ImageDigest)
+		}
+		// The nil time images should be after the valid ones, but order between them doesn't matter
+	})
+	
+	// Test empty slice
+	t.Run("Sorting empty slice", func(t *testing.T) {
+		emptyImages := []types.ImageDetail{}
+		
+		// This should not panic
+		sortImagesByPushedTime(emptyImages)
+		
+		// No assertions needed - just verifying it doesn't panic
+	})
 }
 
 // TestGetImageTag tests the getImageTag function
@@ -520,6 +636,22 @@ func TestDeleteImages(t *testing.T) {
 			t.Errorf("Expected 1 call to BatchDeleteImage, got %d", mockClient.BatchDeleteImageCalls)
 		}
 	})
+	
+	// Test with no images
+	t.Run("No images to delete", func(t *testing.T) {
+		mockClient := &MockECRClient{}
+		
+		// Call with empty slice
+		err := deleteImages(context.Background(), mockClient, repoName, []types.ImageDetail{})
+		
+		// Assertions
+		if err != nil {
+			t.Fatalf("Expected no error, got %v", err)
+		}
+		if mockClient.BatchDeleteImageCalls != 0 {
+			t.Errorf("Expected 0 calls to BatchDeleteImage, got %d", mockClient.BatchDeleteImageCalls)
+		}
+	})
 }
 
 // TestGetImageIdString tests the getImageIdString function
@@ -554,6 +686,32 @@ func TestGetImageIdString(t *testing.T) {
 	// Test with nil
 	t.Run("Nil ImageId", func(t *testing.T) {
 		result := getImageIdString(nil)
+		
+		if result != "unknown" {
+			t.Errorf("Expected 'unknown', got '%s'", result)
+		}
+	})
+	
+	// Test with both tag and digest
+	t.Run("ImageId with both tag and digest", func(t *testing.T) {
+		id := &types.ImageIdentifier{
+			ImageTag: aws.String("latest"),
+			ImageDigest: aws.String("sha256:123"),
+		}
+		
+		result := getImageIdString(id)
+		
+		// Should prefer tag over digest
+		if result != "latest" {
+			t.Errorf("Expected 'latest', got '%s'", result)
+		}
+	})
+	
+	// Test with neither tag nor digest (empty identifier)
+	t.Run("Empty ImageId", func(t *testing.T) {
+		id := &types.ImageIdentifier{}
+		
+		result := getImageIdString(id)
 		
 		if result != "unknown" {
 			t.Errorf("Expected 'unknown', got '%s'", result)
@@ -738,11 +896,10 @@ func TestCleanupECR(t *testing.T) {
 					{ImageTag: aws.String("v1")},
 				},
 			},
-		}
-		
-		// Setup DescribeImages response with the old images
-		mockClient.DescribeImagesOutput = &ecr.DescribeImagesOutput{
-			ImageDetails: []types.ImageDetail{oldImage1, oldImage2},
+			// Setup DescribeImages response with the old images
+			DescribeImagesOutput: &ecr.DescribeImagesOutput{
+				ImageDetails: []types.ImageDetail{oldImage1, oldImage2},
+			},
 		}
 		
 		// Run our test
@@ -796,6 +953,103 @@ func TestCleanupECR(t *testing.T) {
 		}
 		if summary.SpaceFreed != 6000000 {
 			t.Errorf("Expected 6000000 bytes freed (6MB), got %d", summary.SpaceFreed)
+		}
+	})
+}
+
+// TestLoadAWSConfig tests the loadAWSConfig function
+func TestLoadAWSConfig(t *testing.T) {
+	// Because we can't easily mock the AWS config loader directly,
+	// we'll just test the function's basic logic with the actual AWS SDK
+	
+	// Test with default region
+	t.Run("Default region", func(t *testing.T) {
+		ctx := context.Background()
+		_, err := loadAWSConfig(ctx, "")
+		
+		// We're just checking that it doesn't error
+		if err != nil {
+			t.Fatalf("Expected no error, got %v", err)
+		}
+	})
+	
+	// Test with specified region
+	t.Run("Specified region", func(t *testing.T) {
+		ctx := context.Background()
+		specifiedRegion := "eu-central-1"
+		cfg, err := loadAWSConfig(ctx, specifiedRegion)
+		
+		if err != nil {
+			t.Fatalf("Expected no error, got %v", err)
+		}
+		
+		// Check that the region was set correctly
+		if cfg.Region != specifiedRegion {
+			t.Errorf("Expected region to be %s, got %s", specifiedRegion, cfg.Region)
+		}
+	})
+}
+
+// TestParseFlags tests the parseFlags function
+func TestParseFlags(t *testing.T) {
+	// Save original command line arguments and restore after test
+	originalArgs := os.Args
+	defer func() {
+		os.Args = originalArgs
+		flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ExitOnError)
+	}()
+
+	// Test default values
+	t.Run("Default values", func(t *testing.T) {
+		// Reset flags
+		flag.CommandLine = flag.NewFlagSet("test", flag.ContinueOnError)
+		os.Args = []string{"cmd"}
+		
+		// Call parseFlags
+		config := parseFlags()
+		
+		// Check defaults
+		if config.DryRun != false {
+			t.Errorf("Expected DryRun to be false, got %v", config.DryRun)
+		}
+		if config.Days != 10 {
+			t.Errorf("Expected Days to be 10, got %d", config.Days)
+		}
+		if config.Region != "" {
+			t.Errorf("Expected Region to be empty, got %s", config.Region)
+		}
+		if config.MaxImages != 0 {
+			t.Errorf("Expected MaxImages to be 0, got %d", config.MaxImages)
+		}
+	})
+	
+	// Test with custom values
+	t.Run("Custom values", func(t *testing.T) {
+		// Reset flags
+		flag.CommandLine = flag.NewFlagSet("test", flag.ContinueOnError)
+		os.Args = []string{
+			"cmd",
+			"-dry-run=true",
+			"-days=30",
+			"-region=eu-west-1",
+			"-max-images=5",
+		}
+		
+		// Call parseFlags
+		config := parseFlags()
+		
+		// Check values
+		if config.DryRun != true {
+			t.Errorf("Expected DryRun to be true, got %v", config.DryRun)
+		}
+		if config.Days != 30 {
+			t.Errorf("Expected Days to be 30, got %d", config.Days)
+		}
+		if config.Region != "eu-west-1" {
+			t.Errorf("Expected Region to be eu-west-1, got %s", config.Region)
+		}
+		if config.MaxImages != 5 {
+			t.Errorf("Expected MaxImages to be 5, got %d", config.MaxImages)
 		}
 	})
 }

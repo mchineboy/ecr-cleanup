@@ -38,28 +38,7 @@ type CleanupSummary struct {
 	SpaceFreed            int64 // in bytes
 }
 
-// main is the entry point for the application
-func main() {
-	// Parse command line arguments
-	config := parseFlags()
-
-	summary, err := cleanupECR(config)
-	if err != nil {
-		log.Fatalf("Error cleaning up ECR repositories: %v", err)
-	}
-	
-	// Print summary
-	log.Printf("ECR Cleanup Summary:")
-	log.Printf("- Repositories processed: %d", summary.RepositoriesProcessed)
-	log.Printf("- Images deleted: %d", summary.ImagesDeleted)
-	if summary.SpaceFreed > 0 {
-		log.Printf("- Space freed: %.2f MB", float64(summary.SpaceFreed)/1024/1024)
-	}
-	
-	if config.DryRun {
-		log.Printf("Note: This was a dry run. No images were actually deleted.")
-	}
-}
+// Main application entry point moved to main_wrapper.go
 
 // parseFlags parses command line flags and returns the configuration
 func parseFlags() Config {
